@@ -4,6 +4,14 @@ import multiprocessing
 import time
 from github import Github
 import base64
+import sys
+
+# Raise the max digits for int-to-str conversions
+try:
+    sys.set_int_max_str_digits(1000000)  # Raise as high as reasonably safe
+except AttributeError:
+    # For Python versions before 3.11
+    pass
 
 def check_diophantine(params):
     a, b, c, d = params
@@ -14,12 +22,14 @@ def check_diophantine(params):
 
     error = val - 6
 
-    # Safely create error_exp:
+    # Safely create error_exp
     try:
         error_exp = f"{float(error):.2e}"
     except (OverflowError, ValueError):
-        # If conversion to float fails, just convert to string
-        error_exp = str(error)
+        try:
+            error_exp = str(error)
+        except ValueError:
+            error_exp = "[unstringable error: value too large]"
 
     return {
         "a": a, "b": b, "c": c, "d": d,
@@ -40,7 +50,6 @@ def run_solver_and_push(repo, path_in_repo, a_min, a_max, b_min, b_max, c_min, c
 
     results = pool.imap_unordered(check_diophantine, params, chunksize=1000)
 
-    # Prepare JSON with diagnostics + results streaming
     diagnostics = {
         "a_min": a_min, "a_max": a_max,
         "b_min": b_min, "b_max": b_max,
@@ -57,52 +66,8 @@ def run_solver_and_push(repo, path_in_repo, a_min, a_max, b_min, b_max, c_min, c
 
     output_file = f"output_{a_min}_{a_max}_{b_min}_{b_max}_{c_min}_{c_max}_{d_min}_{d_max}.json"
 
-    def generate_json_stream():
-        yield '{"diagnostics": '
-        # Diagnostics will be filled after collecting results, so yield placeholder for now
-        yield json.dumps(diagnostics)[:-1] + ', "checks": [\n'  # Strip closing brace to append checks
-
-        first = True
-        min_err = None
-        error_counter = {}
-        solutions = []
-
-        for res in results:
-            err = res['error']
-            # Track min error
-            if min_err is None or abs(err) < abs(min_err):
-                min_err = err
-            # Track solutions (where error == 0)
-            if err == 0:
-                solutions.append(res)
-            # Track error frequencies
-            err_key = res['error_exp']
-            error_counter[err_key] = error_counter.get(err_key, 0) + 1
-
-            # Yield result with commas except first
-            if not first:
-                yield ',\n'
-            else:
-                first = False
-            yield json.dumps(res)
-
-        # Close checks array
-        yield "\n]}"
-
-        # Update diagnostics (these will be inserted later)
-        diagnostics["end_time"] = time.time()
-        diagnostics["elapsed_time_sec"] = diagnostics["end_time"] - diagnostics["start_time"]
-        diagnostics["min_error"] = min_err
-        diagnostics["solutions_found"] = solutions
-        diagnostics["error_counts"] = error_counter
-
-    # We need the diagnostics to be updated before pushing, so collect all results
-    # This requires a tweak: first collect all results in a list, then update diagnostics, then dump JSON
-
-    # Let's do it this way instead of streaming, for correctness and diagnostics:
     results_list = list(results)
 
-    # Update diagnostics
     min_err = None
     error_counter = {}
     solutions = []
@@ -129,22 +94,25 @@ def run_solver_and_push(repo, path_in_repo, a_min, a_max, b_min, b_max, c_min, c
 
     content = json.dumps(full_output, indent=2)
 
-    # Check if file exists to update or create
     try:
         existing = repo.get_contents(path_in_repo)
         repo.update_file(path_in_repo, f"Update {path_in_repo}", content, existing.sha)
-    except Exception as e:
+    except Exception:
         repo.create_file(path_in_repo, f"Add {path_in_repo}", content)
 
     print(f"Pushed results to GitHub at {path_in_repo}")
     print(f"Elapsed time: {diagnostics['elapsed_time_sec']:.2f} seconds")
     print(f"Minimum error found: {diagnostics['min_error']}")
     print(f"Number of solutions found: {len(solutions)}")
-    print(f"Most frequent error: {max(error_counter, key=error_counter.get) if error_counter else 'N/A'} with {max(error_counter.values()) if error_counter else 0} occurrences")
+    if error_counter:
+        most_freq_err = max(error_counter, key=error_counter.get)
+        print(f"Most frequent error: {most_freq_err} with {error_counter[most_freq_err]} occurrences")
+    else:
+        print("No errors counted.")
 
 def run_interval_loop_automatic(repo, base_path):
     start_min = int(input("Enter starting min value for all variables (e.g., 11): "))
-    step = int(input("Enter step size (e.g., 10): "))
+    step = int(input("Enter step size (e.g., 2): "))
     absolute_max = int(input("Enter absolute max value to stop at (e.g., 10000): "))
 
     cores = multiprocessing.cpu_count()
