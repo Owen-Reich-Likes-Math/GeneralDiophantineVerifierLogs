@@ -2,40 +2,37 @@ import json
 import math
 import multiprocessing
 import time
+from collections import Counter
 from github import Github
-from datetime import datetime
+from github.GithubException import UnknownObjectException
 
-def compute_check(params):
+
+def check_diophantine(params):
     a, b, c, d = params
     try:
         val = pow(a, b) - pow(c, d)
-        error = val - 6
-        # Format error in scientific notation for JSON
-        error_str = f"{error:.2e}"
-        return {
-            "a": a,
-            "b": b,
-            "c": c,
-            "d": d,
-            "value": val,
-            "error": error_str,
-        }
     except OverflowError:
-        # Handle huge powers gracefully
-        return {
-            "a": a,
-            "b": b,
-            "c": c,
-            "d": d,
-            "value": None,
-            "error": "Overflow",
-        }
+        # If power is too big, return a huge error
+        val = float('inf')
+    error = val - 6
+    return {
+        "a": a, "b": b, "c": c, "d": d,
+        "value": val if val != float('inf') else "overflow",
+        "error": error,
+        "error_exp": f"{error:.2e}"
+    }
+
 
 def run_solver_and_push(repo, base_path, a_min, a_max, b_min, b_max, c_min, c_max, d_min, d_max):
     start_time = time.time()
 
-    # Prepare all parameter tuples
-    params_list = [
+    cores = multiprocessing.cpu_count()
+    pool = multiprocessing.Pool(cores)
+
+    print(f"Running solver for intervals: a=[{a_min},{a_max}], b=[{b_min},{b_max}], c=[{c_min},{c_max}], d=[{d_min},{d_max}]")
+    print(f"Using {cores} cores.")
+
+    all_params = [
         (a, b, c, d)
         for a in range(a_min, a_max + 1)
         for b in range(b_min, b_max + 1)
@@ -43,143 +40,137 @@ def run_solver_and_push(repo, base_path, a_min, a_max, b_min, b_max, c_min, c_ma
         for d in range(d_min, d_max + 1)
     ]
 
-    num_checks = len(params_list)
-    print(f"Total checks in this interval: {num_checks}")
+    # Streaming results by yielding from pool.imap_unordered to reduce memory
+    results = pool.imap_unordered(check_diophantine, all_params)
 
-    pool = multiprocessing.Pool()
-    results_iter = pool.imap_unordered(compute_check, params_list)
-    
-    # Prepare filename with intervals
-    filename = f"logs_a{a_min}-{a_max}_b{b_min}-{b_max}_c{c_min}-{c_max}_d{d_min}-{d_max}.json"
-    full_path = f"{base_path}/{filename}" if base_path else filename
+    # Collect errors and track solutions
+    error_counter = Counter()
+    solution_count = 0
+    min_error = None
+    min_error_tuple = None
+    errors_sum = 0
+    total_checks = 0
 
-    # Stream JSON writing
-    # We will write one big JSON with diagnostics + results array
-    with open(filename, "w", encoding="utf-8") as f:
-        # Diagnostics placeholders
-        diagnostics = {
-            "a_range": [a_min, a_max],
-            "b_range": [b_min, b_max],
-            "c_range": [c_min, c_max],
-            "d_range": [d_min, d_max],
-            "num_checks": num_checks,
-            "start_time": datetime.utcnow().isoformat() + "Z",
-            "solutions": [],
-            "errors_count": {},
-            "min_abs_error": None,
-            "min_error_tuple": None,
-        }
+    checks = []
 
-        f.write("{\n")
-        f.write('"diagnostics": ')
-        json.dump(diagnostics, f)
-        f.write(",\n")
-        f.write('"checks": [\n')
+    for res in results:
+        total_checks += 1
+        # error can be float('inf'), skip those for min/avg error calc
+        if isinstance(res["error"], (int, float)) and math.isfinite(res["error"]):
+            errors_sum += abs(res["error"])
+            error_counter[res["error_exp"]] += 1
+            if min_error is None or abs(res["error"]) < abs(min_error):
+                min_error = res["error"]
+                min_error_tuple = (res["a"], res["b"], res["c"], res["d"], res["error_exp"])
+            if res["error"] == 0:
+                solution_count += 1
 
-        first = True
-        min_abs_error = None
-        min_error_tuple = None
-        errors_count = {}
-        solutions = []
+        # Store check but no printing to console to avoid lag
+        checks.append(res)
 
-        for res in results_iter:
-            # Update diagnostics on the fly
-            if res["error"] == "Overflow":
-                # Count overflows as error type
-                errors_count["Overflow"] = errors_count.get("Overflow", 0) + 1
-            else:
-                try:
-                    err_val = float(res["error"])
-                    abs_err = abs(err_val)
-                    errors_count[res["error"]] = errors_count.get(res["error"], 0) + 1
-                    if min_abs_error is None or abs_err < min_abs_error:
-                        min_abs_error = abs_err
-                        min_error_tuple = (res["a"], res["b"], res["c"], res["d"], res["error"])
-                    if abs_err == 0:
-                        solutions.append(res)
-                except Exception:
-                    # Just ignore errors parsing
-                    pass
+    avg_error = errors_sum / total_checks if total_checks else 0
+    top_errors = error_counter.most_common(5)
+    end_time = time.time()
 
-            if not first:
-                f.write(",\n")
-            else:
-                first = False
-            json.dump(res, f)
+    diagnostics = {
+        "intervals": {
+            "a": [a_min, a_max],
+            "b": [b_min, b_max],
+            "c": [c_min, c_max],
+            "d": [d_min, d_max]
+        },
+        "cores_used": cores,
+        "solution_count": solution_count,
+        "average_error": f"{avg_error:.2e}",
+        "top_5_errors": [{"error": e, "count": c} for e, c in top_errors],
+        "min_error_tuple": {
+            "a": min_error_tuple[0] if min_error_tuple else None,
+            "b": min_error_tuple[1] if min_error_tuple else None,
+            "c": min_error_tuple[2] if min_error_tuple else None,
+            "d": min_error_tuple[3] if min_error_tuple else None,
+            "error": min_error_tuple[4] if min_error_tuple else None,
+        },
+        "total_checks": total_checks,
+        "computation_time_seconds": round(end_time - start_time, 4)
+    }
 
-        f.write("\n],\n")
+    output_json = {
+        "diagnostics": diagnostics,
+        "checks": checks
+    }
 
-        # Finalize diagnostics
-        diagnostics["min_abs_error"] = min_abs_error
-        diagnostics["min_error_tuple"] = min_error_tuple
-        diagnostics["errors_count"] = errors_count
-        diagnostics["solutions"] = solutions
-        diagnostics["end_time"] = datetime.utcnow().isoformat() + "Z"
-        diagnostics["elapsed_seconds"] = time.time() - start_time
+    # Filename based on ranges
+    filename = f"diophantine_a{a_min}-{a_max}_b{b_min}-{b_max}_c{c_min}-{c_max}_d{d_min}-{d_max}.json"
+    path_in_repo = f"{base_path}/{filename}" if base_path else filename
 
-        # Move file cursor to start to overwrite diagnostics with updated info
-        f.seek(0)
-        f.write("{\n")
-        f.write('"diagnostics": ')
-        json.dump(diagnostics, f)
-        f.write(",\n")
-        f.write('"checks": [\n')
+    content = json.dumps(output_json, indent=2)
 
-        # Reset results iterator to write all results again (re-run)
-        # Instead, let's just append the diagnostics again at the end:
-        # We'll have to close the JSON properly:
-        # (Since we cannot rewind and re-write the whole file easily with streaming, let's write diagnostics twice.)
-        # Alternatively, you could collect all results in memory, but that defeats streaming.
-        # So we print a warning about diagnostics being less accurate until end.
-        f.write("]\n}")
-    pool.close()
-    pool.join()
-
-    print(f"Interval {a_min}-{a_max} done in {diagnostics['elapsed_seconds']:.2f} seconds.")
-    print(f"Minimum absolute error: {min_abs_error}")
-    print(f"Solutions found: {len(solutions)}")
-
-    # Now push the file to GitHub
+    # GitHub push - update if exists, else create new
     try:
-        with open(filename, "r", encoding="utf-8") as f:
-            content = f.read()
-
-        try:
-            existing = repo.get_contents(full_path)
-            repo.update_file(path=full_path, message=f"Update {filename}", content=content, sha=existing.sha)
-            print(f"Updated existing file {full_path} in GitHub repo.")
-        except Exception:
-            repo.create_file(path=full_path, message=f"Add {filename}", content=content)
-            print(f"Created new file {full_path} in GitHub repo.")
-    except Exception as e:
-        print(f"Failed to push file to GitHub: {e}")
+        existing_file = repo.get_contents(path_in_repo)
+        repo.update_file(
+            path=path_in_repo,
+            message=f"Update {filename}",
+            content=content,
+            sha=existing_file.sha
+        )
+        print(f"Updated file {path_in_repo} on GitHub.")
+    except UnknownObjectException:
+        repo.create_file(
+            path=path_in_repo,
+            message=f"Add {filename}",
+            content=content
+        )
+        print(f"Created new file {path_in_repo} on GitHub.")
 
     return diagnostics
 
-def run_interval_loop():
-    print("--- Diophantine solver + GitHub push interval runner ---")
-    repo_path = input("Enter repository and file path (username/repo/path/to/file.json): ").strip()
-    token = input("Enter your GitHub personal access token: ").strip()
 
-    g = Github(token)
-    try:
-        repo_name, *path_parts = repo_path.split('/')
-        repo = g.get_repo(repo_name + "/" + path_parts[0])
-        base_path = "/".join(path_parts[1:]) if len(path_parts) > 1 else ""
-    except Exception as e:
-        print(f"Error accessing repo: {e}")
-        return
+def run_interval_loop_manual(repo, base_path):
+    print("--- Manual interval runner ---")
+    a_min = int(input("Enter min for a: "))
+    a_max = int(input("Enter max for a: "))
+    b_min = int(input("Enter min for b: "))
+    b_max = int(input("Enter max for b: "))
+    c_min = int(input("Enter min for c: "))
+    c_max = int(input("Enter max for c: "))
+    d_min = int(input("Enter min for d: "))
+    d_max = int(input("Enter max for d: "))
 
+    while True:
+        diagnostics = run_solver_and_push(
+            repo, base_path,
+            a_min, a_max, b_min, b_max, c_min, c_max, d_min, d_max
+        )
+        print(f"Completed interval {a_min}-{a_max} for all variables.")
+
+        cont = input("Run next interval? (y/n): ").strip().lower()
+        if cont != 'y':
+            break
+
+        # Move to next interval
+        step_a = a_max - a_min + 1
+        step_b = b_max - b_min + 1
+        step_c = c_max - c_min + 1
+        step_d = d_max - d_min + 1
+
+        a_min, a_max = a_max + 1, a_max + step_a
+        b_min, b_max = b_max + 1, b_max + step_b
+        c_min, c_max = c_max + 1, c_max + step_c
+        d_min, d_max = d_max + 1, d_max + step_d
+
+
+def run_interval_loop_automatic(repo, base_path):
+    print("--- Automatic interval runner ---")
     start = int(input("Enter starting min value for all variables (e.g., 11): "))
     step = int(input("Enter step size (e.g., 10): "))
     upper_limit = int(input("Enter absolute max value to stop at (e.g., 100): "))
 
-    current_min = start
-    current_max = start + step - 1
-
-    # Print number of CPU cores detected
     cores = multiprocessing.cpu_count()
     print(f"Using {cores} cores.")
+
+    current_min = start
+    current_max = start + step - 1
 
     while current_min <= upper_limit:
         current_max = min(current_max, upper_limit)
@@ -194,13 +185,34 @@ def run_interval_loop():
             d_min=current_min, d_max=current_max,
         )
 
-        cont = input(f"Run next interval [{current_max + 1}, {current_max + step}]? (y/n): ").lower()
-        if cont != 'y':
-            print("Stopping interval run.")
-            break
-
         current_min = current_max + 1
         current_max = current_min + step - 1
 
+    print("All intervals completed!")
+
+
+def main():
+    print("--- Diophantine solver + GitHub push ---")
+    repo_path = input("Enter repository and file path (username/repo/path/to/file.json): ").strip()
+    token = input("Enter your GitHub personal access token: ").strip()
+
+    try:
+        g = Github(token)
+        repo_name, *path_parts = repo_path.split('/')
+        repo = g.get_repo(f"{repo_name}/{path_parts[0]}")
+        base_path = "/".join(path_parts[1:]) if len(path_parts) > 1 else ""
+    except Exception as e:
+        print(f"Error accessing repo: {e}")
+        return
+
+    mode = input("Choose mode: manual intervals (m) or automatic intervals (a): ").strip().lower()
+    if mode == 'm':
+        run_interval_loop_manual(repo, base_path)
+    elif mode == 'a':
+        run_interval_loop_automatic(repo, base_path)
+    else:
+        print("Invalid mode selected.")
+
+
 if __name__ == "__main__":
-    run_interval_loop()
+    main()
