@@ -32,87 +32,119 @@ def process_ab(args):
             print(f"Checking a={a},b={b},c={c},d={d} → value={val}, error={error}")
             recs.append({'a':a,'b':b,'c':c,'d':d,'solution':is_sol,'error':error})
             errs.append(error)
-            cnt[error]+=1
+            cnt[error] += 1
             if is_sol:
-                sols.append((a,b,c,d))
+                sols.append((a, b, c, d))
             abs_e = abs(error)
-            if least is None or abs_e<least[0]:
-                least=(abs_e,a,b,c,d,error)
+            if least is None or abs_e < least[0]:
+                least = (abs_e, a, b, c, d, error)
     return recs, errs, cnt, sols, least
 
 
 def main():
     print("--- Diophantine solver + GitHub push ---")
-    # GitHub login via input() for compatibility
+    # GitHub login and repository/path input
+    repo_input = input("Enter repository and file path (username/repo/path/to/file.json): ")
+    parts = repo_input.strip().split('/', 2)
+    if len(parts) < 3:
+        print("Invalid input format. Use username/repo/path/to/file.json")
+        return
+    repo_name = f"{parts[0]}/{parts[1]}"
+    path_in_repo = parts[2]
     token = input("Enter your GitHub personal access token: ")
     gh = Github(token)
-    repo_name = input("Enter repository (username/repo): ")
-    repo = gh.get_repo(repo_name)
+    try:
+        repo = gh.get_repo(repo_name)
+    except Exception as e:
+        print(f"Failed to access repository {repo_name}: {e}")
+        return
 
     # Prompt for ranges
-    a_min,a_max = get_range('a')
-    b_min,b_max = get_range('b')
-    c_min,c_max = get_range('c')
-    d_min,d_max = get_range('d')
+    a_min, a_max = get_range('a')
+    b_min, b_max = get_range('b')
+    c_min, c_max = get_range('c')
+    d_min, d_max = get_range('d')
 
     cores = cpu_count()
     print(f"Using {cores} cores.")
 
-    tasks=[(a,b,c_min,c_max,d_min,d_max)
-           for a in range(a_min,a_max+1)
-           for b in range(b_min,b_max+1)]
+    tasks = [(a, b, c_min, c_max, d_min, d_max)
+             for a in range(a_min, a_max+1)
+             for b in range(b_min, b_max+1)]
 
-    t0=time.time()
+    t0 = time.time()
     with Pool(cores) as pool:
-        parts=pool.map(process_ab,tasks)
-    t1=time.time()
+        parts = pool.map(process_ab, tasks)
+    t1 = time.time()
 
     # Aggregate results
-    all_recs=[]; all_errs=[]; total_cnt=Counter(); all_sols=[]; least=None
+    all_recs = []
+    all_errs = []
+    total_cnt = Counter()
+    all_sols = []
+    least = None
     for recs, errs, cnt, sols, least_r in parts:
         all_recs.extend(recs)
         all_errs.extend(errs)
         total_cnt.update(cnt)
         all_sols.extend(sols)
-        if least_r and (least is None or least_r[0]<least[0]): least=least_r
+        if least_r and (least is None or least_r[0] < least[0]):
+            least = least_r
 
-    total=len(all_errs)
-    num_sol=len(all_sols)
-    avg_err=sum(abs(e) for e in all_errs)/total if total else None
-    top5=total_cnt.most_common(5)
+    total = len(all_errs)
+    num_sol = len(all_sols)
+    avg_err = sum(abs(e) for e in all_errs) / total if total else None
+    top5 = total_cnt.most_common(5)
 
-    diagnostics={
-        'ranges':{'a':[a_min,a_max],'b':[b_min,b_max],'c':[c_min,c_max],'d':[d_min,d_max]},
-        'cores':cores,
-        'computation_time_sec':t1-t0,
-        'num_solutions':num_sol,
-        'avg_error':avg_err,
-        'top_errors':top5,
-        'least_error_record':least
+    diagnostics = {
+        'ranges': {'a': [a_min, a_max], 'b': [b_min, b_max],
+                   'c': [c_min, c_max], 'd': [d_min, d_max]},
+        'cores': cores,
+        'computation_time_sec': t1 - t0,
+        'num_solutions': num_sol,
+        'avg_error': avg_err,
+        'top_errors': top5,
+        'least_error_record': least
     }
 
-    output_filename = f"results_{a_min}-{a_max}_{b_min}-{b_max}_{c_min}-{c_max}_{d_min}-{d_max}.json"
-    data = {'diagnostics':diagnostics, 'checks': all_recs}
-    with open(output_filename,'w') as f:
-        json.dump(data,f,indent=2)
+    data = {'diagnostics': diagnostics, 'checks': all_recs}
 
-    # Summary
+    # Write local JSON
+    with open('temp_results.json', 'w') as f:
+        json.dump(data, f, indent=2)
+
+    # Push to GitHub (create or update)
+    with open('temp_results.json', 'r') as f:
+        content = f.read()
+    try:
+        existing = repo.get_contents(path_in_repo)
+        repo.update_file(
+            path=path_in_repo,
+            message=f"Update {path_in_repo}",
+            content=content,
+            sha=existing.sha
+        )
+        print(f"Updated {path_in_repo} in {repo_name}.")
+    except Exception:
+        repo.create_file(
+            path=path_in_repo,
+            message=f"Add {path_in_repo}",
+            content=content
+        )
+        print(f"Created {path_in_repo} in {repo_name}.")
+
+    # Print summary
     print("\nSummary:")
     print(f"Total checks: {total}")
-    print(f"Solutions: {num_sol}")
-    print(f"Avg error: {avg_err}")
+    print(f"Solutions found: {num_sol}")
+    print(f"Average error: {avg_err}")
     print("Top errors:")
-    for e,cnt in top5: print(f"  Error={e}, Count={cnt}")
-    if least: _,a,b,c,d,err=least; print(f"Least error: a={a},b={b},c={c},d={d}, error={err}")
-    print(f"Saved to {output_filename}")
+    for e, cnt in top5:
+        print(f"  Error={e}, Count={cnt}")
+    if least:
+        _, a, b, c, d, err = least
+        print(f"Least error at a={a},b={b},c={c},d={d}, error={err}")
+    print("Done.")
 
-    # Push to GitHub
-    with open(output_filename) as f: content=f.read()
-    try:
-        repo.create_file(output_filename, f"Add {output_filename}", content)
-        print(f"Pushed {output_filename} to {repo_name}.")
-    except Exception as e:
-        print(f"GitHub push failed: {e}")
-
-if __name__=='__main__':
+if __name__ == '__main__':
     main()
