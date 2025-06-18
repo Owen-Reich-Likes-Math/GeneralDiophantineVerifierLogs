@@ -1,7 +1,8 @@
 import time
 import json
+import os
 from collections import Counter
-from multiprocessing import Pool, cpu_count
+from multiprocessing import Process, cpu_count, Manager
 from github import Github
 
 def get_range(var_name):
@@ -17,33 +18,33 @@ def get_range(var_name):
             print("Invalid input. Please enter two integers separated by a space.")
 
 
-def process_ab(args):
-    a, b, c_min, c_max, d_min, d_max = args
-    recs = []
-    errs = []
-    cnt = Counter()
-    sols = []
-    least = None
-    for c in range(c_min, c_max+1):
-        for d in range(d_min, d_max+1):
-            val = a**b - c**d
-            error = 6 - val
-            is_sol = (val == 6)
-            print(f"Checking a={a},b={b},c={c},d={d} → value={val}, error={error}")
-            recs.append({'a':a,'b':b,'c':c,'d':d,'solution':is_sol,'error':error})
-            errs.append(error)
-            cnt[error] += 1
-            if is_sol:
-                sols.append((a, b, c, d))
-            abs_e = abs(error)
-            if least is None or abs_e < least[0]:
-                least = (abs_e, a, b, c, d, error)
-    return recs, errs, cnt, sols, least
+def format_scientific(n: int) -> str:
+    if n == 0:
+        return "0"
+    sign = "-" if n < 0 else ""
+    s = str(abs(n))
+    exp = len(s) - 1
+    # take first two digits for mantissa
+    if len(s) >= 2:
+        mant = f"{s[0]}.{s[1]}"
+    else:
+        mant = f"{s[0]}.0"
+    return f"{sign}{mant}e{exp}"
+
+
+def worker(task_slice, queue, c_range, d_range):
+    for a, b in task_slice:
+        for c in range(*c_range):
+            for d in range(*d_range):
+                val = a**b - c**d
+                error = 6 - val
+                queue.put(({ 'a': a, 'b': b, 'c': c, 'd': d,
+                             'error': format_scientific(error) }))
+    queue.put(None)  # sentinel for this worker
 
 
 def main():
     print("--- Diophantine solver + GitHub push ---")
-    # GitHub login and repository/path input
     repo_input = input("Enter repository and file path (username/repo/path/to/file.json): ")
     parts = repo_input.strip().split('/', 2)
     if len(parts) < 3:
@@ -59,7 +60,6 @@ def main():
         print(f"Failed to access repository {repo_name}: {e}")
         return
 
-    # Prompt for ranges
     a_min, a_max = get_range('a')
     b_min, b_max = get_range('b')
     c_min, c_max = get_range('c')
@@ -68,83 +68,108 @@ def main():
     cores = cpu_count()
     print(f"Using {cores} cores.")
 
-    tasks = [(a, b, c_min, c_max, d_min, d_max)
-             for a in range(a_min, a_max+1)
-             for b in range(b_min, b_max+1)]
+    tasks = [(a, b) for a in range(a_min, a_max+1) for b in range(b_min, b_max+1)]
+    manager = Manager()
+    queue = manager.Queue(maxsize=1000)
 
-    t0 = time.time()
-    with Pool(cores) as pool:
-        parts = pool.map(process_ab, tasks)
-    t1 = time.time()
+    # temp file for streaming checks
+    temp_path = 'checks_temp.jsonl'
+    if os.path.exists(temp_path): os.remove(temp_path)
 
-    # Aggregate results
-    all_recs = []
-    all_errs = []
-    total_cnt = Counter()
-    all_sols = []
-    least = None
-    for recs, errs, cnt, sols, least_r in parts:
-        all_recs.extend(recs)
-        all_errs.extend(errs)
-        total_cnt.update(cnt)
-        all_sols.extend(sols)
-        if least_r and (least is None or least_r[0] < least[0]):
-            least = least_r
+    # start workers
+    chunk = len(tasks) // cores + 1
+    workers = []
+    for i in range(cores):
+        slice_ = tasks[i*chunk:(i+1)*chunk]
+        p = Process(target=worker, args=(slice_, queue, (c_min, c_max+1), (d_min, d_max+1)))
+        p.start()
+        workers.append(p)
 
-    total = len(all_errs)
-    num_sol = len(all_sols)
-    avg_err = sum(abs(e) for e in all_errs) / total if total else None
-    top5 = total_cnt.most_common(5)
-
+    # collect and write temp JSONL
+    finished_workers = 0
     diagnostics = {
-        'ranges': {'a': [a_min, a_max], 'b': [b_min, b_max],
-                   'c': [c_min, c_max], 'd': [d_min, d_max]},
+        'ranges': {'a': [a_min, a_max], 'b': [b_min, b_max], 'c': [c_min, c_max], 'd': [d_min, d_max]},
         'cores': cores,
-        'computation_time_sec': t1 - t0,
-        'num_solutions': num_sol,
-        'avg_error': avg_err,
-        'top_errors': top5,
-        'least_error_record': least
+        'computation_time_sec': None,
+        'num_solutions': 0,
+        'avg_error': None,
+        'top_errors': None,
+        'least_error_record': None
     }
+    error_vals = []
+    error_counter = Counter()
+    least = None
 
-    data = {'diagnostics': diagnostics, 'checks': all_recs}
+    start = time.time()
+    with open(temp_path, 'w') as tmpf:
+        while finished_workers < cores:
+            rec = queue.get()
+            if rec is None:
+                finished_workers += 1
+                continue
+            tmpf.write(json.dumps(rec) + '\n')
+            # update diagnostics
+            err_str = rec['error']
+            # convert back to magnitude for counters? approximate: use first digit *10^exp
+            # parsing mantissa and exponent
+            if err_str != '0':
+                mant, exp = err_str.split('e')
+                val = float(mant) * (10 ** int(exp))
+                error_vals.append(abs(val))
+                error_counter[err_str] += 1
+                # least error by magnitude
+                if least is None or abs(val) < least[0]:
+                    least = (abs(val), rec)
+                if rec.get('solution'):
+                    diagnostics['num_solutions'] += 1
+            else:
+                error_vals.append(0)
+                error_counter['0'] += 1
+                if least is None or 0 < least[0]:
+                    least = (0, rec)
+                if rec.get('solution'):
+                    diagnostics['num_solutions'] += 1
 
-    # Write local JSON
-    with open('temp_results.json', 'w') as f:
-        json.dump(data, f, indent=2)
+    end = time.time()
+    diagnostics['computation_time_sec'] = end - start
+    diagnostics['avg_error'] = sum(error_vals) / len(error_vals) if error_vals else None
+    diagnostics['top_errors'] = error_counter.most_common(5)
+    diagnostics['least_error_record'] = least[1] if least else None
 
-    # Push to GitHub (create or update)
-    with open('temp_results.json', 'r') as f:
+    # write final JSON
+    output_filename = f"results_{a_min}-{a_max}_{b_min}-{b_max}_{c_min}-{c_max}_{d_min}-{d_max}.json"
+    with open(temp_path, 'r') as tmpf, open(output_filename, 'w') as outf:
+        outf.write('{' + json.dumps('diagnostics') + ':' )
+        outf.write(json.dumps(diagnostics, indent=2))
+        outf.write(',"checks":[\n')
+        first = True
+        for line in tmpf:
+            if not first:
+                outf.write(',\n')
+            outf.write(line.strip())
+            first = False
+        outf.write('\n]}')
+
+    # cleanup temp
+    os.remove(temp_path)
+
+    # push to GitHub
+    with open(output_filename, 'r') as f:
         content = f.read()
     try:
         existing = repo.get_contents(path_in_repo)
-        repo.update_file(
-            path=path_in_repo,
-            message=f"Update {path_in_repo}",
-            content=content,
-            sha=existing.sha
-        )
-        print(f"Updated {path_in_repo} in {repo_name}.")
-    except Exception:
-        repo.create_file(
-            path=path_in_repo,
-            message=f"Add {path_in_repo}",
-            content=content
-        )
-        print(f"Created {path_in_repo} in {repo_name}.")
+        repo.update_file(path=path_in_repo,
+                         message=f"Update {path_in_repo}",
+                         content=content,
+                         sha=existing.sha)
+        print(f"Updated {path_in_repo}.")
+    except:
+        repo.create_file(path=path_in_repo,
+                         message=f"Add {path_in_repo}",
+                         content=content)
+        print(f"Created {path_in_repo}.")
 
-    # Print summary
-    print("\nSummary:")
-    print(f"Total checks: {total}")
-    print(f"Solutions found: {num_sol}")
-    print(f"Average error: {avg_err}")
-    print("Top errors:")
-    for e, cnt in top5:
-        print(f"  Error={e}, Count={cnt}")
-    if least:
-        _, a, b, c, d, err = least
-        print(f"Least error at a={a},b={b},c={c},d={d}, error={err}")
-    print("Done.")
+    print(f"Done. Output written to {output_filename} and pushed.")
 
 if __name__ == '__main__':
     main()
