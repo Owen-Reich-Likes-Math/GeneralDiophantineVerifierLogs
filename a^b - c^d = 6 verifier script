@@ -24,11 +24,7 @@ def format_scientific(n: int) -> str:
     sign = "-" if n < 0 else ""
     s = str(abs(n))
     exp = len(s) - 1
-    # take first two digits for mantissa
-    if len(s) >= 2:
-        mant = f"{s[0]}.{s[1]}"
-    else:
-        mant = f"{s[0]}.0"
+    mant = f"{s[0]}.{s[1]}" if len(s) >= 2 else f"{s[0]}.0"
     return f"{sign}{mant}e{exp}"
 
 
@@ -40,18 +36,19 @@ def worker(task_slice, queue, c_range, d_range):
                 error = 6 - val
                 queue.put({'a': a, 'b': b, 'c': c, 'd': d,
                            'error': format_scientific(error)})
-    queue.put(None)  # sentinel
+    queue.put(None)
 
 
 def main():
     print("--- Diophantine solver + GitHub push ---")
-    repo_input = input("Enter repository and file path (username/repo/path/to/file.json): ")
+    # Get repo/path
+    repo_input = input("Enter repository and file path or directory (username/repo/path/to/file_or_dir): ")
     parts = repo_input.strip().split('/', 2)
     if len(parts) < 3:
-        print("Invalid input format. Use username/repo/path/to/file.json")
+        print("Invalid input format. Use username/repo/path/to/file_or_dir")
         return
     repo_name = f"{parts[0]}/{parts[1]}"
-    path_in_repo = parts[2]
+    path_in_repo = parts[2].rstrip('/')
     token = input("Enter your GitHub personal access token: ")
     gh = Github(token)
     try:
@@ -60,6 +57,7 @@ def main():
         print(f"Failed to access repository {repo_name}: {e}")
         return
 
+    # Ranges
     a_min, a_max = get_range('a')
     b_min, b_max = get_range('b')
     c_min, c_max = get_range('c')
@@ -70,20 +68,20 @@ def main():
 
     tasks = [(a, b) for a in range(a_min, a_max+1)
              for b in range(b_min, b_max+1)]
-    manager = Manager()
-    queue = manager.Queue(maxsize=1000)
+    manager = Manager(); queue = manager.Queue(maxsize=1000)
 
     temp_path = 'checks_temp.jsonl'
     if os.path.exists(temp_path): os.remove(temp_path)
 
+    # Start workers
     chunk = len(tasks) // cores + 1
     procs = []
     for i in range(cores):
         slice_ = tasks[i*chunk:(i+1)*chunk]
         p = Process(target=worker, args=(slice_, queue, (c_min, c_max+1), (d_min, d_max+1)))
-        p.start()
-        procs.append(p)
+        p.start(); procs.append(p)
 
+    # Diagnostics
     finished = 0
     diagnostics = {
         'ranges': {'a': [a_min, a_max], 'b': [b_min, b_max],
@@ -99,6 +97,7 @@ def main():
     error_counter = Counter()
     least = None
 
+    # Stream to JSONL
     start = time.time()
     with open(temp_path, 'w') as tmpf:
         while finished < cores:
@@ -107,63 +106,64 @@ def main():
                 finished += 1
                 continue
             tmpf.write(json.dumps(rec) + '\n')
-            # update diagnostics
             err_str = rec['error']
             if err_str != '0':
                 mant, exp = err_str.split('e')
                 val = float(mant) * (10 ** int(exp))
             else:
                 val = 0.0
-            error_vals.append(abs(val))
+            abs_val = abs(val)
+            error_vals.append(abs_val)
             error_counter[err_str] += 1
-            if least is None or abs(val) < least[0]:
-                least = (abs(val), rec)
-            # note: 'solution' not tracked here
-
+            if least is None or abs_val < least[0]:
+                least = (abs_val, rec)
     end = time.time()
+
     diagnostics['computation_time_sec'] = end - start
-    diagnostics['avg_error'] = sum(error_vals) / len(error_vals) if error_vals else None
+    diagnostics['avg_error'] = sum(error_vals)/len(error_vals) if error_vals else None
     diagnostics['top_errors'] = error_counter.most_common(5)
     diagnostics['least_error_record'] = least[1] if least else None
 
+    # Final JSON
     output_filename = f"results_{a_min}-{a_max}_{b_min}-{b_max}_{c_min}-{c_max}_{d_min}-{d_max}.json"
+    if path_in_repo.lower().endswith('.json'):
+        target_path = path_in_repo
+    else:
+        target_path = f"{path_in_repo}/{output_filename}"
+
     with open(temp_path, 'r') as tmpf, open(output_filename, 'w') as outf:
-        outf.write('{' + json.dumps('diagnostics') + ':')
+        outf.write('{"diagnostics":')
         outf.write(json.dumps(diagnostics, indent=2))
         outf.write(',"checks":[\n')
         first = True
         for line in tmpf:
-            if not first:
-                outf.write(',\n')
-            outf.write(line.strip())
-            first = False
+            if not first: outf.write(',\n')
+            outf.write(line.strip()); first = False
         outf.write('\n]}')
 
     os.remove(temp_path)
 
-    # Push to GitHub (create or update)
+    # Push to GitHub
     with open(output_filename, 'r') as f:
         content = f.read()
     try:
-        existing = repo.get_contents(path_in_repo)
-        if isinstance(existing, list):
-            raise Exception('Not a file')
+        existing = repo.get_contents(target_path)
         repo.update_file(
-            path=path_in_repo,
-            message=f"Update {path_in_repo}",
+            path=target_path,
+            message=f"Update {target_path}",
             content=content,
             sha=existing.sha
         )
-        print(f"Updated {path_in_repo} in {repo_name}.")
-    except Exception:
+        print(f"Updated {target_path} in {repo_name}.")
+    except:
         repo.create_file(
-            path=path_in_repo,
-            message=f"Add {path_in_repo}",
+            path=target_path,
+            message=f"Add {target_path}",
             content=content
         )
-        print(f"Created {path_in_repo} in {repo_name}.")
+        print(f"Created {target_path} in {repo_name}.")
 
-    print(f"Done. Output written to {output_filename} and pushed to GitHub.")
+    print(f"Done. Output written to {output_filename} and pushed as {target_path}.")
 
 if __name__ == '__main__':
     main()
